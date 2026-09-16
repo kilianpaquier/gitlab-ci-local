@@ -2,7 +2,6 @@ import "./global.js";
 import {RE2JS} from "re2js";
 import chalk from "chalk-template";
 import jsep from "jsep";
-import jsepRegex from "@jsep-plugin/regex";
 import {Job, JobRule, Need, Service} from "./job.js";
 import {needsComplex} from "./data-expander.js";
 import fs from "fs-extra";
@@ -22,9 +21,26 @@ import {withFileLock} from "./pid-file-lock.js";
 
 const RSYNC_LOCK_TIMEOUT_MS = 3_600_000;
 
-jsep.plugins.register(jsepRegex); // /pattern/flags literals
+// Lex /pattern/flags literals without validating them as JS RegExp.
+// GitLab uses RE2, which accepts constructs JS rejects ((?i), (?P<n>), ...).
+const REGEX_LITERAL = /\/((?:\\.|[^\\/])*)\/[a-z]*/isy;
+
+jsep.hooks.add("gobble-token", function (env) {
+    if (this.char !== "/") return;
+
+    REGEX_LITERAL.lastIndex = this.index;
+    const match = REGEX_LITERAL.exec(this.expr) ?? this.throwError("Unclosed Regex");
+
+    this.index += match[0].length;
+    env.node = {type: "Literal", value: match[1], raw: match[0]};
+});
+
 jsep.addBinaryOp("=~", 10); // regex match operator
 jsep.addBinaryOp("!~", 10); // regex non-match operator
+
+const RE2_FLAGS: Record<string, number> = {i: RE2JS.CASE_INSENSITIVE, m: RE2JS.MULTILINE, s: RE2JS.DOTALL};
+
+type RuleValue = string | number | boolean | null;
 
 type RuleResultOpt = {
     argv: Argv;
@@ -236,21 +252,6 @@ export class Utils {
         return {when, allowFailure, variables: ruleVariable, needs: ruleNeeds};
     }
 
-    // Reconstruct the source string for an atomic (non-logical) jsep node.
-    // Identifiers keep their name ($VAR), literals use their raw form so that
-    // strings retain quotes and regexes retain slashes and flags.
-    private static _nodeToAtom (node: jsep.Expression): string {
-        switch (node.type) {
-            case "Identifier": return (node as jsep.Identifier).name;
-            case "Literal": return (node as jsep.Literal).raw;
-            case "BinaryExpression": {
-                const n = node as jsep.BinaryExpression;
-                return `${Utils._nodeToAtom(n.left)} ${n.operator} ${Utils._nodeToAtom(n.right)}`;
-            }
-            default: throw new Error(`Unsupported expression node type: ${(node as any).type}`);
-        }
-    }
-
     static stripQuotes (str: string) {
         if (str.length < 2) return str;
         const first = str[0];
@@ -265,116 +266,84 @@ export class Utils {
         if (ruleIf === undefined) return true;
         assert(typeof ruleIf === "string", chalk`This GitLab CI configuration is invalid: {blueBright rules:if} must be a string, but got {red ${JSON.stringify(ruleIf)}}`);
         assert(!/\$\{\w+\}/.test(ruleIf), chalk`rules:rule if invalid expression syntax: {blueBright ${ruleIf}}\nuse {green $VAR} not {red \${VAR\}} in rules:if`);
-        let evalStr = ruleIf;
-        evalStr = this.expandTextWith(evalStr, {
-            unescape: JSON.stringify("$"),
-            variable: (name) => JSON.stringify(envs[name] ?? null).replaceAll("\\\\", "\\"),
-        }); // replace all $VAR by their values
 
-        const flagsToBinary = (flags: string): number => {
-            let binary = 0;
-            if (flags.includes("i")) {
-                binary |= RE2JS.CASE_INSENSITIVE;
-            }
-            if (flags.includes("s")) {
-                binary |= RE2JS.DOTALL;
-            }
-            if (flags.includes("m")) {
-                binary |= RE2JS.MULTILINE;
-            }
-            return binary;
+        const fail = (reason: string): never => {
+            return assert.fail(`Error attempting to evaluate the following rules:\n  rules:\n    - if: '${ruleIf}'\n${reason}`);
         };
-        // jsep parses ruleIf into an AST, handling &&, ||, () and operator precedence.
-        const walk = (node: jsep.Expression): boolean => {
-            if (node.type === "BinaryExpression") {
-                const n = node as jsep.BinaryExpression;
-                if (n.operator === "&&") return walk(n.left) && walk(n.right);
-                if (n.operator === "||") return walk(n.left) || walk(n.right);
-                if (n.operator === "=~" || n.operator === "!~") {
-                    assert(n.left.type === "Literal", `Not a Literal: ${JSON.stringify(n.left)}`);
-                    assert(n.right.type === "Literal", `Not a Literal: ${JSON.stringify(n.right)}`);
-                    const leftStr = n.left as jsep.Literal;
-                    const rightStr = n.right as jsep.Literal;
-                    if (leftStr.value === null)
-                        return n.operator === "!~"; // null =~ /p/ → false; null !~ /p/ → true
-                    if (rightStr.value === null)
-                        return false;
-                    let regexStr: string = rightStr.raw;
-                    regexStr = this.stripQuotes(regexStr);
 
-                    const regex = /\/(?<pattern>.*)\/(?<flags>[igmsuy]*)/;
-                    const _rhs = regexStr.replace(regex, (_: string, pattern: string, flags: string) => {
-                        const flagsBinary = flagsToBinary(flags);
-                        return `RE2JS.compile(${JSON.stringify(pattern)}, ${flagsBinary})`;
-                    });
-
-                    const assertMsg = [
-                        `RHS (${regexStr}) must be a regex pattern. Do not rely on this behavior!`,
-                        "Refer to https://docs.gitlab.com/ee/ci/jobs/job_rules.html#unexpected-behavior-from-regular-expression-matching-with- for more info...",
-                    ];
-                    assert(_rhs !== regexStr, assertMsg.join("\n"));
-
-                    const _operator = n.operator === "=~" ? "!=" : "=="; // =~ -> !=; !~ -> ==
-
-                    const evalStr = `${leftStr.raw}.matchRE2JS(${_rhs}) ${_operator} null`;
-
-                    let res;
-                    try {
-                        (globalThis as any).RE2JS = RE2JS;
-                        res = (0, eval)(evalStr); // indirect eval
-                        delete (globalThis as any).RE2JS;
-                    } catch (error) {
-                        console.error(error);
-                        const assertMsg = [
-                            "Error attempting to evaluate the following rules:",
-                            "  rules:",
-                            `    - if: '${Utils._nodeToAtom(node)}'`,
-                            "as",
-                            "```javascript",
-                            `${evalStr}`,
-                            "```",
-                        ];
-                        assert(false, assertMsg.join("\n"));
-                    }
-                    return Boolean(res);
+        const valueOf = (node: jsep.Expression): RuleValue => {
+            switch (node.type) {
+                case "Identifier": {
+                    const name = (node as jsep.Identifier).name;
+                    if (!name.startsWith("$")) return fail(`Unsupported identifier: ${name}`);
+                    return envs[name.slice(1)] ?? null;
                 }
+                case "Literal": return (node as jsep.Literal).value as RuleValue;
+                default: return fail(`Unsupported expression: ${node.type}`);
             }
-            const atom = Utils._nodeToAtom(node);
-            let res;
-            try {
-                (globalThis as any).RE2JS = RE2JS;
-                res = (0, eval)(atom);
-                delete (globalThis as any).RE2JS;
-            } catch {
-                assert(false, [
-                    "Error attempting to evaluate the following rules:",
-                    "  rules:",
-                    `    - if: '${ruleIf}'`,
-                    "as",
-                    "```javascript",
-                    `${atom}`,
-                    "```",
-                ].join("\n"));
-            }
-            return Boolean(res);
         };
 
-        let ast;
+        const rhsSource = (node: jsep.Expression): string | null => {
+            // Regex and string literals are read from `raw`: jsep decodes `\d` to `d` inside a string literal.
+            const isLiteral = node.type === "Literal" && (node as jsep.Literal).value !== null;
+
+            const source = isLiteral ? Utils.stripQuotes((node as jsep.Literal).raw) : valueOf(node);
+            return source === null ? null : String(source);
+        };
+
+        const compileRegex = (match: RegExpExecArray): RE2JS => {
+            const [, pattern, flags] = match;
+            const bits = [...flags].reduce((acc, flag) => acc | (RE2_FLAGS[flag] ?? 0), 0);
+            try {
+                return RE2JS.compile(pattern, bits);
+            } catch (error) {
+                return fail(String(error));
+            }
+        };
+
+        // Matches GitLab, which falls back to a substring check when the RHS isn't a regex.
+        const matches = (left: jsep.Expression, right: jsep.Expression): boolean => {
+            const subject = valueOf(left);
+            const source = rhsSource(right);
+            const match = source === null ? null : /^\/(.*)\/([a-z]*)$/.exec(source);
+            if (source !== null && match === null) {
+                return subject === null || source.includes(String(subject));
+            }
+            if (subject === null) return false;
+            if (match === null) return false;
+            return String(subject).matchRE2JS(compileRegex(match)) !== null;
+        };
+
+        const walk = (node: jsep.Expression): boolean => {
+            switch (node.type) {
+                case "UnaryExpression": {
+                    const {operator, argument} = node as jsep.UnaryExpression;
+                    if (operator !== "!") return fail(`Unsupported operator: ${operator}`);
+                    return !walk(argument);
+                }
+                case "BinaryExpression": {
+                    const {operator, left, right} = node as jsep.BinaryExpression;
+                    switch (operator) {
+                        case "&&": return walk(left) && walk(right);
+                        case "||": return walk(left) || walk(right);
+                        case "==": return valueOf(left) == valueOf(right);
+                        case "!=": return valueOf(left) != valueOf(right);
+                        case "=~": return matches(left, right);
+                        case "!~": return !matches(left, right);
+                        default: return fail(`Unsupported operator: ${operator}`);
+                    }
+                }
+                default: return Boolean(valueOf(node));
+            }
+        };
+
+        let ast: jsep.Expression;
         try {
-            ast = jsep(evalStr);
-        } catch {
-            const assertMsg = [
-                "Error attempting to evaluate the following rules:",
-                "  rules:",
-                `    - if: '${ruleIf}'`,
-                "as",
-                "```javascript",
-                `${evalStr}`,
-                "```",
-            ];
-            assert(false, assertMsg.join("\n"));
+            ast = jsep(ruleIf);
+        } catch (error) {
+            return fail(String(error));
         }
-        return walk(ast!);
+        return walk(ast);
     }
 
     static evaluateRuleExist (cwd: string, ruleExists: string[] | {paths: string[]} | undefined): boolean {

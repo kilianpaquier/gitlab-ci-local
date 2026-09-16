@@ -90,6 +90,15 @@ test.concurrent("rejects ${VAR} curly-bracket reference", () => {
         .toThrow(/rules:rule if invalid expression syntax/);
 });
 
+test.concurrent("unary not on parenthesized comparison", () => {
+    expect(Utils.evaluateRuleIf("!($VAR == 'x')", {VAR: "y"})).toBe(true);
+    expect(Utils.evaluateRuleIf("!($VAR == 'x')", {VAR: "x"})).toBe(false);
+});
+
+test.concurrent("unary not on undefined var", () => {
+    expect(Utils.evaluateRuleIf("!$VAR", {})).toBe(true);
+});
+
 test.concurrent("VAR exists fail", () => {
     const ruleIf = "$VAR";
     const val = Utils.evaluateRuleIf(ruleIf, {});
